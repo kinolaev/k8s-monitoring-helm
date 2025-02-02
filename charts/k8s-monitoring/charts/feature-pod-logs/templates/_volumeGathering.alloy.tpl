@@ -1,42 +1,76 @@
-{{- define "feature.podLogs.discovery.alloy" }}
-discovery.relabel "filtered_pods" {
-  targets = discovery.kubernetes.pods.targets
+{{- define "feature.podLogs.volumeGathering.alloy" }}
+discovery.kubernetes "volume_gathering_pods" {
+  role = "pod"
+  selectors {
+    role = "pod"
+    field = "spec.nodeName=" + sys.env("HOSTNAME")
+  }
+{{- if .Values.volumeGathering.namespaces }}
+  namespaces {
+    names = {{ .Values.namespaces | toJson }}
+  }
+{{- end }}
+{{- if or .Values.volumeGathering.labelSelectors .Values.volumeGathering.fieldSelectors }}
+  selectors {
+    role = "pod"
+{{- if .Values.volumeGathering.labelSelectors }}
+    label = {{ .Values.volumeGathering.labelSelectors | toJson }}
+{{- end }}
+{{- if .Values.volumeGathering.fieldSelectors }}
+    field = {{ .Values.volumeGathering.fieldSelectors | join "," | quote }}
+{{- end }}
+  }
+{{- end }}
+{{- if or .Values.volumeGathering.nodeLabelSelectors .Values.volumeGathering.nodeFieldSelectors }}
+  attach_metadata {
+    node = true
+  }
+  selectors {
+    role = "node"
+{{- if .Values.volumeGathering.nodeLabelSelectors }}
+    label = {{ .Values.volumeGathering.nodeLabelSelectors | toJson }}
+{{- end }}
+{{- if .Values.volumeGathering.nodeFieldSelectors }}
+    field = {{ .Values.volumeGathering.nodeFieldSelectors | join "," | quote }}
+{{- end }}
+  }
+{{- end }}
+}
+
+discovery.relabel "volume_gathering_pods" {
+  targets = discovery.kubernetes.volume_gathering_pods.targets
   rule {
     source_labels = ["__meta_kubernetes_namespace"]
     action = "replace"
     target_label = "namespace"
   }
-{{- if .Values.excludeNamespaces }}
+{{- if .Values.volumeGathering.excludeNamespaces }}
   rule {
     source_labels = ["namespace"]
-    regex = "{{ .Values.excludeNamespaces | join "|" }}"
+    regex = "{{ .Values.volumeGathering.excludeNamespaces | join "|" }}"
     action = "drop"
   }
 {{- end }}
   rule {
     source_labels = ["__meta_kubernetes_pod_name"]
-    action = "replace"
     target_label = "pod"
   }
   rule {
     source_labels = ["__meta_kubernetes_pod_container_name"]
-    action = "replace"
     target_label = "container"
   }
+
   rule {
     source_labels = ["__meta_kubernetes_namespace", "__meta_kubernetes_pod_container_name"]
     separator = "/"
-    action = "replace"
     replacement = "$1"
     target_label = "job"
   }
 
   // set the container runtime as a label
   rule {
-    action = "replace"
     source_labels = ["__meta_kubernetes_pod_container_id"]
     regex = "^(\\S+):\\/\\/.+$"
-    replacement = "$1"
     target_label = "tmp_container_runtime"
   }
 
@@ -53,6 +87,19 @@ discovery.relabel "filtered_pods" {
     action = "labelmap"
     regex = "__meta_kubernetes_pod_annotation_(.+)"
   }
+
+{{- range $label, $k8sAnnotation := .Values.annotations }}
+  rule {
+    source_labels = ["{{ include "pod_annotation" $k8sAnnotation }}"]
+    target_label = {{ $label | quote }}
+  }
+{{- end }}
+{{- range $label, $k8sLabels := .Values.labels }}
+  rule {
+    source_labels = ["{{ include "pod_label" $k8sLabels }}"]
+    target_label = {{ $label | quote }}
+  }
+{{- end }}
 
   // explicitly set service_name. if not set, loki will automatically try to populate a default.
   // see https://grafana.com/docs/loki/latest/get-started/labels/#default-labels-for-all-users
@@ -95,6 +142,13 @@ discovery.relabel "filtered_pods" {
     target_label = "deployment_environment"
   }
 
+  rule {
+    source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+    separator = "/"
+    replacement = "{{ .Values.volumeGathering.podLogsPath }}/*$1/*.log"
+    target_label = "__path__"
+  }
+
 {{- range $label, $k8sAnnotation := .Values.annotations }}
   rule {
     source_labels = ["{{ include "pod_annotation" $k8sAnnotation }}"]
@@ -108,8 +162,20 @@ discovery.relabel "filtered_pods" {
   }
 {{- end }}
 
-{{- if .Values.extraDiscoveryRules }}
-{{ .Values.extraDiscoveryRules | indent 2 }}
+{{- if .Values.volumeGathering.extraDiscoveryRules }}
+{{ .Values.volumeGathering.extraDiscoveryRules | indent 2 }}
 {{- end }}
 }
+
+local.file_match "volume_gathering_pods" {
+  path_targets = discovery.relabel.volume_gathering_pods.output
+}
+
+loki.source.file "volume_gathering_pods" {
+  targets    = local.file_match.volume_gathering_pods.targets
+{{- if .Values.volumeGathering.onlyGatherNewLogLines | default .Values.volumeGatherSettings.onlyGatherNewLogLines }}
+  tail_from_end = {{ .Values.volumeGathering.onlyGatherNewLogLines | default .Values.volumeGatherSettings.onlyGatherNewLogLines }}
 {{- end }}
+  forward_to = [loki.process.pod_log_processor.receiver]
+}
+{{- end -}}
